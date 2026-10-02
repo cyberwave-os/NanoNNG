@@ -564,9 +564,9 @@ tlstran_pipe_send_cb(void *arg)
 	n   = nni_msg_len(msg);
 	cmd = nni_msg_cmd_type(msg);
 	if (cmd == CMD_CONNACK) {
-		header = nni_msg_header(msg);
-		// parse result code TODO verify bug
-		flag = header[3];
+		header = nni_msg_body(msg);
+		// CONNACK variable header: acknowledge flags, then reason code.
+		flag = header[1];
 	}
 	// nni_pipe_bump_tx(p->npipe, n);
 	nni_mtx_unlock(&p->mtx);

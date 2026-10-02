@@ -910,8 +910,8 @@ send:
 	// verify connect
 	// for websocket, cmd type is 0x00 for PUBLISH
 	if (nni_msg_cmd_type(msg) == CMD_CONNACK) {
-		uint8_t *header = nni_msg_header(msg);
-		if (*(header + 3) != 0x00) {
+		uint8_t *body = nni_msg_body(msg);
+		if (body[1] != 0x00) {
 			nni_atomic_set_bool(&p->closed, true);
 			// TODO get err code from CONNACK
 			p->err_code = NOT_AUTHORIZED;
@@ -1171,8 +1171,8 @@ send:
 	nni_aio_set_msg(aio, NULL);
 	// verify connect
 	if (nni_msg_cmd_type(msg) == CMD_CONNACK) {
-		uint8_t *header = nni_msg_header(msg);
-		if (*(header + 3) != 0x00) {
+		uint8_t *body = nni_msg_body(msg);
+		if (body[1] != 0x00) {
 			nni_atomic_set_bool(&p->closed, true);
 			p->err_code = NOT_AUTHORIZED;
 		}

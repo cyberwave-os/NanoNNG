@@ -85,6 +85,7 @@ struct nano_pipe {
 	uint16_t 	ka_refresh; // ka_refresh count how many times the keepalive
 	                     	// timer has been triggered
 	bool          busy;
+	bool          auth_rejected; // close only after the failure CONNACK is sent
 	bool          event; // indicates if exposure disconnect event is valid
 	void         *tree;  // root node of db tree
 	void         *nano_qos_db; // 'sqlite' or 'nni_id_hash_map'
@@ -611,6 +612,7 @@ nano_pipe_init(void *arg, nni_pipe *pipe, void *s)
 
 	nni_mtx_init(&p->lk);
 	nni_lmq_init(&p->rlmq, sock->conf->msq_len);
+	p->auth_rejected = false;
 	nni_aio_init(&p->aio_send, nano_pipe_send_cb, p);
 	nni_aio_init(&p->aio_timer, nano_pipe_timer_cb, p);
 	nni_aio_init(&p->aio_recv, nano_pipe_recv_cb, p);
@@ -721,6 +723,10 @@ auth_verify:
 			    p->conn_param, &s->conf->auth_http);
 		}
 	}
+	// HTTP auth uses MQTT 5 reason codes; MQTT 3.1.1 needs return code 5.
+	if (p->conn_param->pro_ver != MQTT_PROTOCOL_VERSION_v5 && rv >= 0x80) {
+		rv = 0x05;
+	}
 	nmq_connack_encode(msg, s->conf, p->conn_param, rv);
 	nni_mtx_lock(&s->lk);
 
@@ -744,10 +750,23 @@ auth_verify:
 		return NNG_ECLOSED;
 	}
 	if (rv != 0) {
-		// send connack with reason code 0x05
 		log_warn("Invalid auth info or authentication denied");
+		// Do not register a rejected connection or expose it to the app.
+		// Returning the auth error here makes the core close the transport
+		// before it can deliver CONNACK. Close in the send completion instead.
+		p->auth_rejected = true;
+		p->event = false;
 		p->conn_param->will_flag = 0;
-		goto end;
+		p->conn_param->clean_start = 1;
+		conn_param_free(p->conn_param); // balance the clone above
+		nni_msg_set_cmd_type(msg, CMD_CONNACK);
+		nni_atomic_set_bool(&p->closed, false);
+		p->busy = true;
+		nni_aio_set_timeout(&p->aio_send, 5000);
+		nni_aio_set_msg(&p->aio_send, msg);
+		nni_mtx_unlock(&s->lk);
+		nni_pipe_send(p->pipe, &p->aio_send);
+		return 0;
 	}
 	// Clientid should not be NULL since broker will assign one
 	// TODO use p_id
@@ -836,7 +855,6 @@ auth_verify:
 		// Try aio abort to close old pipe due to data racing in reaper.
 		nni_aio_abort(&old->aio_timer, NNG_ECONNABORTED);
 	}
-end:
 	if (rv == 0) {
 		nni_sleep_aio(s->conf->qos_duration * 1500, &p->aio_timer);
 	}
@@ -1025,6 +1043,12 @@ nano_pipe_send_cb(void *arg)
 		nni_msg_free(msg);
 		nni_aio_set_msg(&p->aio_send, NULL);
 		nni_atomic_set(&p->reason_code, rv);
+		nni_pipe_close(p->pipe);
+		return;
+	}
+	if (p->auth_rejected) {
+		nni_msg_free(nni_aio_get_msg(&p->aio_send));
+		nni_aio_set_msg(&p->aio_send, NULL);
 		nni_pipe_close(p->pipe);
 		return;
 	}
