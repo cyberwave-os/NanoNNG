@@ -1619,6 +1619,16 @@ char *remove_white_space(char *str)
 
 char *remove_escape(char *str)
 {
+    // Credentials serialized by jq/jsonencode must retain JSON escapes.
+    cJSON *value = cJSON_Parse(str);
+    if (cJSON_IsString(value)) {
+        char *decoded = strdup(value->valuestring);
+        cJSON_Delete(value);
+        return decoded;
+    }
+    cJSON_Delete(value);
+    // Keep upstream handling for non-JSON HOCON escape sequences.
+
         str++;
         char *ret = NULL;
         while ('\0' != *str) {
