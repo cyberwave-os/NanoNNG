@@ -714,7 +714,8 @@ auth_verify:
 	rv = verify_connect(p->conn_param, s->conf);
 	// TODO Avoid holding s->lk across HTTP authentication.
 	if (rv == SUCCESS) {
-		if (s->conf->auth_http.enable) {
+		if (s->conf->auth_http.enable &&
+		    verify_local_credentials(p->conn_param, s->conf) != 1) {
 			log_debug("HTTP Authentication start!");
 			rv = nmq_auth_http_connect(		// potential dead lock if HTTP fails
 			    p->conn_param, &s->conf->auth_http);

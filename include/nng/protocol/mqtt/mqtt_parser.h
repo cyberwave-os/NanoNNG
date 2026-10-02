@@ -92,6 +92,7 @@ NNG_DECL uint32_t fnv1a_hashn(char *str, size_t n);
 NNG_DECL uint8_t  crc_hashn(char *str, size_t n);
 NNG_DECL uint32_t crc32_hashn(char *str, size_t n);
 NNG_DECL uint32_t crc32c_hashn(char *str, size_t n);
+NNG_DECL int verify_local_credentials(conn_param *cparam, conf *conf);
 NNG_DECL uint8_t  verify_connect(conn_param *cparam, conf *conf);
 
 // repack

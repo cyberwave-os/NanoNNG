@@ -1302,47 +1302,47 @@ nano_encode_publish_msg(uint8_t proto_ver, uint8_t qos, bool retain, bool dup,
 	return msg;
 }
 
-uint8_t
-verify_connect(conn_param *cparam, conf *conf)
+// -1: no local account; 0: reserved account with bad password; 1: valid.
+int
+verify_local_credentials(conn_param *cparam, conf *conf)
 {
-	int   i, n;
-	char *username = (char *) cparam->username.body;
-	char *password = (char *) cparam->password.body;
-
-	if (conf->allow_anonymous == true) {
-		log_debug("allow anonymous connect");
-		return 0;
+	if (cparam == NULL || !conf->auths.enable ||
+	    conf->auths.count == 0 || cparam->username.len == 0) {
+		return -1;
 	}
-
-	if (cparam->username.len == 0 || cparam->password.len == 0) {
-		log_warn("Client Username/Password is NULL!");
-		if (cparam->pro_ver == 5) {
-			return BAD_USER_NAME_OR_PASSWORD;
-		} else {
-			return 0x04;
-		}
-	}
-
-	if ((!conf->auths.enable) || conf->auths.count == 0) {
-		log_debug("authentication is not enabled");
-		return 0;
-	}
+	int result = -1;
 	nng_mtx_lock(conf->auths.mtx);
-	n = conf->auths.count;
-	for (i = 0; i < n; i++) {
-		if (strcmp(username, conf->auths.usernames[i]) == 0 &&
-		    strcmp(password, conf->auths.passwords[i]) == 0) {
-			log_debug("Found matched Username/Password!");
-			nng_mtx_unlock(conf->auths.mtx);
-			return 0;
+	for (int i = 0; i < conf->auths.count; i++) {
+		if (cparam->username.len == strlen(conf->auths.usernames[i]) &&
+		    memcmp(cparam->username.body, conf->auths.usernames[i],
+		        cparam->username.len) == 0) {
+			result = cparam->password.len > 0 &&
+			    cparam->password.len == strlen(conf->auths.passwords[i]) &&
+			    memcmp(cparam->password.body, conf->auths.passwords[i],
+			        cparam->password.len) == 0 ? 1 : 0;
+			break;
 		}
 	}
 	nng_mtx_unlock(conf->auths.mtx);
-	if (cparam->pro_ver == 5) {
-		return BAD_USER_NAME_OR_PASSWORD;
-	} else {
-		return 0x05;
+	return result;
+}
+
+uint8_t
+verify_connect(conn_param *cparam, conf *conf)
+{
+	int local = verify_local_credentials(cparam, conf);
+	// Never send a reserved local username with a bad password to HTTP.
+	if (local == 1) {
+		return SUCCESS;
 	}
+	if (local == -1 && cparam->username.len > 0 &&
+	    cparam->password.len > 0 && conf->auth_http.enable) {
+		return SUCCESS; // CONNECT caller must perform HTTP authentication.
+	}
+	if (local == -1 && conf->allow_anonymous) {
+		return SUCCESS;
+	}
+	return cparam->pro_ver == 5 ? BAD_USER_NAME_OR_PASSWORD : 0x04;
 }
 
 nng_msg *
