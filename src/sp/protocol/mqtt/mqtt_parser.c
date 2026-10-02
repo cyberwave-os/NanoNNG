@@ -1302,7 +1302,7 @@ nano_encode_publish_msg(uint8_t proto_ver, uint8_t qos, bool retain, bool dup,
 	return msg;
 }
 
-// -1: no local account; 0: reserved account with bad password; 1: valid.
+// -1: no local account; 0: local password mismatch; 1: valid.
 int
 verify_local_credentials(conn_param *cparam, conf *conf)
 {
@@ -1330,12 +1330,22 @@ verify_local_credentials(conn_param *cparam, conf *conf)
 uint8_t
 verify_connect(conn_param *cparam, conf *conf)
 {
+	// HTTP form callbacks cannot preserve embedded NUL bytes. Reject them
+	// before a truncated password could acquire the system principal in HTTP.
+	if (cparam == NULL ||
+	    (cparam->username.len > 0 && memchr(cparam->username.body, 0,
+	        cparam->username.len) != NULL) ||
+	    (cparam->password.len > 0 && memchr(cparam->password.body, 0,
+	        cparam->password.len) != NULL)) {
+		return cparam != NULL && cparam->pro_ver == 5 ?
+		    BAD_USER_NAME_OR_PASSWORD : 0x04;
+	}
 	int local = verify_local_credentials(cparam, conf);
-	// Never send a reserved local username with a bad password to HTTP.
+	// Local credential mismatches may be legacy API-token clients.
 	if (local == 1) {
 		return SUCCESS;
 	}
-	if (local == -1 && cparam->username.len > 0 &&
+	if (local != 1 && cparam->username.len > 0 &&
 	    cparam->password.len > 0 && conf->auth_http.enable) {
 		return SUCCESS; // CONNECT caller must perform HTTP authentication.
 	}
