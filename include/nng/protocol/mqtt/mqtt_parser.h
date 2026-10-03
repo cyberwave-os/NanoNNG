@@ -104,6 +104,9 @@ NNG_DECL nano_pipe_db *nano_msg_get_subtopic(
     nng_msg *msg, nano_pipe_db *root, conn_param *cparam);
 NNG_DECL void nano_msg_free_pipedb(nano_pipe_db *db);
 NNG_DECL void nano_msg_ubsub_free(nano_pipe_db *db);
+// CONNACK reasons are MQTT 5 reason codes everywhere in the broker; this gives
+// the byte actually sent to a client speaking `pro_ver` (3.1.1 return codes).
+NNG_DECL uint8_t nmq_connack_wire_reason(uint8_t pro_ver, uint8_t reason);
 NNG_DECL void nmq_connack_encode(
     nng_msg *msg, conf *conf, conn_param *cparam, uint8_t reason);
 NNG_DECL void nmq_connack_session(nng_msg *msg, bool session);

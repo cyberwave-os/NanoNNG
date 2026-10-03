@@ -216,6 +216,33 @@ test_shared_filter_skip()
 	NUTS_ASSERT(shared_filter_skip(NULL) == NULL);
 }
 
+void
+test_connack_wire_reason(void)
+{
+	// MQTT 5 clients get the reason code unchanged.
+	NUTS_ASSERT(nmq_connack_wire_reason(MQTT_PROTOCOL_VERSION_v5,
+	                NMQ_SERVER_UNAVAILABLE) == NMQ_SERVER_UNAVAILABLE);
+	NUTS_ASSERT(nmq_connack_wire_reason(MQTT_PROTOCOL_VERSION_v5,
+	                NMQ_NOT_AUTHORIZED) == NMQ_NOT_AUTHORIZED);
+
+	// MQTT 3.1.1: success and codes it already has are untouched, the MQTT 5
+	// refusals map to 0x03 / 0x04 / 0x05, anything else is "not authorized".
+	NUTS_ASSERT(nmq_connack_wire_reason(MQTT_PROTOCOL_VERSION_v311, 0) == 0);
+	NUTS_ASSERT(nmq_connack_wire_reason(MQTT_PROTOCOL_VERSION_v311,
+	                NMQ_V311_CONNACK_NOT_AUTHORIZED) ==
+	    NMQ_V311_CONNACK_NOT_AUTHORIZED);
+	NUTS_ASSERT(nmq_connack_wire_reason(MQTT_PROTOCOL_VERSION_v311,
+	                NMQ_SERVER_UNAVAILABLE) ==
+	    NMQ_V311_CONNACK_SERVER_UNAVAILABLE);
+	NUTS_ASSERT(nmq_connack_wire_reason(MQTT_PROTOCOL_VERSION_v311,
+	                NMQ_BAD_USER_NAME_OR_PASSWORD) ==
+	    NMQ_V311_CONNACK_BAD_USER_NAME_OR_PASSWORD);
+	NUTS_ASSERT(nmq_connack_wire_reason(MQTT_PROTOCOL_VERSION_v311,
+	                NMQ_NOT_AUTHORIZED) == NMQ_V311_CONNACK_NOT_AUTHORIZED);
+	NUTS_ASSERT(nmq_connack_wire_reason(MQTT_PROTOCOL_VERSION_v311,
+	                NMQ_SERVER_BUSY) == NMQ_V311_CONNACK_NOT_AUTHORIZED);
+}
+
 NUTS_TESTS = {
 	{ "mqtt_parser pub_extras", test_pub_extra },
 	{ "mqtt_parser utf8_check", test_utf8_check },
@@ -230,6 +257,7 @@ NUTS_TESTS = {
 	{ "mqtt_parser topic_filter", test_topic_filter },
 	{ "mqtt_parser topic_filtern", test_topic_filtern },
 	{ "mqtt_parser shared_filter_skip", test_shared_filter_skip },
+	{ "mqtt_parser connack_wire_reason", test_connack_wire_reason },
 
 	{ NULL, NULL },
 };

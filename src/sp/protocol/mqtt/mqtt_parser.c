@@ -797,15 +797,34 @@ conn_handler(uint8_t *packet, conn_param *cparam, size_t max)
 	return rv;
 }
 
+uint8_t
+nmq_connack_wire_reason(uint8_t pro_ver, uint8_t reason)
+{
+	if (pro_ver == MQTT_PROTOCOL_VERSION_v5 || reason < 0x80) {
+		return reason;
+	}
+	// MQTT 3.1.1 has no return code above 0x05: map the refusals this broker
+	// sends, and answer anything else as "not authorized".
+	switch (reason) {
+	case NMQ_SERVER_UNAVAILABLE:
+		return NMQ_V311_CONNACK_SERVER_UNAVAILABLE;
+	case NMQ_BAD_USER_NAME_OR_PASSWORD:
+		return NMQ_V311_CONNACK_BAD_USER_NAME_OR_PASSWORD;
+	default:
+		return NMQ_V311_CONNACK_NOT_AUTHORIZED;
+	}
+}
+
 /**
- * @brief handle and encode CONNACK packet
+ * @brief handle and encode CONNACK packet; reason is an MQTT 5 reason code
  */
 void
 nmq_connack_encode(nng_msg *msg, conf *conf, conn_param *cparam, uint8_t reason)
 {
 	uint8_t ack_flag = 0x00;
+	uint8_t wire     = nmq_connack_wire_reason(cparam->pro_ver, reason);
 	nni_msg_append(msg, &ack_flag, 1);
-	nni_msg_append(msg, &reason, 1);
+	nni_msg_append(msg, &wire, 1);
 
 	if (cparam->pro_ver == MQTT_PROTOCOL_VERSION_v5 && cparam->properties != NULL) {
 		property *prop = property_get(cparam->properties,
@@ -1337,8 +1356,7 @@ verify_connect(conn_param *cparam, conf *conf)
 	        cparam->username.len) != NULL) ||
 	    (cparam->password.len > 0 && memchr(cparam->password.body, 0,
 	        cparam->password.len) != NULL)) {
-		return cparam != NULL && cparam->pro_ver == 5 ?
-		    BAD_USER_NAME_OR_PASSWORD : 0x04;
+		return NMQ_BAD_USER_NAME_OR_PASSWORD;
 	}
 	int local = verify_local_credentials(cparam, conf);
 	// Local credential mismatches may be legacy API-token clients.
@@ -1352,7 +1370,7 @@ verify_connect(conn_param *cparam, conf *conf)
 	if (local == -1 && conf->allow_anonymous) {
 		return SUCCESS;
 	}
-	return cparam->pro_ver == 5 ? BAD_USER_NAME_OR_PASSWORD : 0x04;
+	return NMQ_BAD_USER_NAME_OR_PASSWORD;
 }
 
 nng_msg *

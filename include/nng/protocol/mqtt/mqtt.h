@@ -81,6 +81,13 @@ enum err_t {
 #define NMQ_SERVER_SHUTTING_DOWN 0x8B
 #define NMQ_KEEP_ALIVE_TIMEOUT 0x8D
 #define NMQ_AUTH_SUB_ERROR 0X87
+#define NMQ_BAD_USER_NAME_OR_PASSWORD 0x86
+#define NMQ_NOT_AUTHORIZED 0x87
+
+// MQTT 3.1.1 CONNACK return codes for the refusals above
+#define NMQ_V311_CONNACK_SERVER_UNAVAILABLE 0x03
+#define NMQ_V311_CONNACK_BAD_USER_NAME_OR_PASSWORD 0x04
+#define NMQ_V311_CONNACK_NOT_AUTHORIZED 0x05
 
 // MQTT Control Packet types
 typedef enum {

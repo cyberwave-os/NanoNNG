@@ -492,12 +492,22 @@ nano_sock_fini(void *arg)
 	nni_msg_free(s->pingmsg);
 }
 
+// Under an HTTP auth backend outage every reconnecting client is refused. Log at
+// most one such line per interval and report how many were left out, so a
+// reconnect storm cannot rotate the useful history out of the container log.
+#define OUTAGE_LOG_INTERVAL_MS 1000
+static nni_atomic_u64 outage_log_last_ms;
+static nni_atomic_u64 outage_log_dropped;
+
 static void
 nano_sock_init(void *arg, nni_sock *sock)
 {
 	nano_sock *s = arg;
 
 	NNI_ARG_UNUSED(sock);
+
+	nni_atomic_init64(&outage_log_last_ms);
+	nni_atomic_init64(&outage_log_dropped);
 
 	nni_mtx_init(&s->lk);
 
@@ -656,23 +666,66 @@ log_safe_copy(const char *in, char *out, size_t cap)
 	out[i] = '\0';
 }
 
-// Reason as seen by the client, for either MQTT 3.1.1 (0x03..0x05) or MQTT 5
-// (0x86..0x88) CONNACK codes.
+// Name of a CONNACK refusal, given as an MQTT 5 reason code.
 static const char *
-connack_reason_name(uint8_t code)
+connack_reason_name(uint8_t reason)
 {
-	switch (code) {
-	case 0x03:
+	switch (reason) {
 	case NMQ_SERVER_UNAVAILABLE:
 		return "server unavailable";
-	case 0x04:
-	case 0x86:
+	case NMQ_BAD_USER_NAME_OR_PASSWORD:
 		return "bad user name or password";
-	case 0x05:
-	case NMQ_AUTH_SUB_ERROR: // 0x87, not authorized
+	case NMQ_NOT_AUTHORIZED:
 		return "not authorized";
 	default:
 		return "rejected";
+	}
+}
+
+static bool
+outage_log_allowed(uint64_t *dropped)
+{
+	uint64_t now  = (uint64_t) nni_clock();
+	uint64_t last = nni_atomic_get64(&outage_log_last_ms);
+	if ((last != 0 && now - last < OUTAGE_LOG_INTERVAL_MS) ||
+	    !nni_atomic_cas64(&outage_log_last_ms, last, now)) {
+		nni_atomic_inc64(&outage_log_dropped);
+		return false;
+	}
+	*dropped = nni_atomic_swap64(&outage_log_dropped, 0);
+	return true;
+}
+
+// One line per rejected CONNECT, never the password. A backend outage is an
+// error (operators must act); a denial is a warning. `reason` is an MQTT 5
+// reason code; the line also shows the byte the client receives.
+static void
+log_connect_rejected(conn_param *cparam, uint8_t reason, bool http_attempted)
+{
+	char     clientid[65], username[65], ip[48];
+	uint8_t  wire = nmq_connack_wire_reason(cparam->pro_ver, reason);
+	uint64_t dropped = 0;
+
+	if (reason == NMQ_SERVER_UNAVAILABLE && !outage_log_allowed(&dropped)) {
+		return;
+	}
+	log_safe_copy(conn_param_get_clientid(cparam), clientid, sizeof(clientid));
+	log_safe_copy((const char *) conn_param_get_username(cparam), username,
+	    sizeof(username));
+	log_safe_copy(conn_param_get_ip_addr_v4(cparam), ip, sizeof(ip));
+	if (reason == NMQ_SERVER_UNAVAILABLE) {
+		log_error("CONNECT rejected: reason=%s code=0x%02x stage=http "
+		          "clientid=%s username=%s ip=%s proto=%d (HTTP auth "
+		          "backend unavailable; %llu similar rejections "
+		          "suppressed)",
+		    connack_reason_name(reason), wire, clientid, username, ip,
+		    cparam->pro_ver, (unsigned long long) dropped);
+	} else {
+		log_warn("CONNECT rejected: reason=%s code=0x%02x stage=%s "
+		         "clientid=%s username=%s ip=%s proto=%d",
+		    connack_reason_name(reason), wire,
+		    http_attempted ? "http" : "local", clientid, username, ip,
+		    cparam->pro_ver);
 	}
 }
 
@@ -764,12 +817,7 @@ auth_verify:
 			    p->conn_param, &s->conf->auth_http);
 		}
 	}
-	uint8_t reject_reason = rv; // before the MQTT 3.1.1 mapping below
-	// HTTP auth uses MQTT 5 reason codes. MQTT 3.1.1 return codes: 0x03
-	// server unavailable (backend could not decide), 0x05 not authorized.
-	if (p->conn_param->pro_ver != MQTT_PROTOCOL_VERSION_v5 && rv >= 0x80) {
-		rv = rv == NMQ_SERVER_UNAVAILABLE ? 0x03 : 0x05;
-	}
+	// rv is an MQTT 5 reason code; the encoder maps it for MQTT 3.1.1.
 	nmq_connack_encode(msg, s->conf, p->conn_param, rv);
 	nni_mtx_lock(&s->lk);
 
@@ -793,29 +841,7 @@ auth_verify:
 		return NNG_ECLOSED;
 	}
 	if (rv != 0) {
-		// One line per rejected CONNECT, never the password. A backend
-		// outage is an error (operators must act); a denial is a warning.
-		char log_clientid[65], log_username[65], log_ip[48];
-		log_safe_copy(conn_param_get_clientid(p->conn_param),
-		    log_clientid, sizeof(log_clientid));
-		log_safe_copy((const char *) conn_param_get_username(p->conn_param),
-		    log_username, sizeof(log_username));
-		log_safe_copy(conn_param_get_ip_addr_v4(p->conn_param), log_ip,
-		    sizeof(log_ip));
-		if (reject_reason == NMQ_SERVER_UNAVAILABLE) {
-			log_error("CONNECT rejected: reason=%s code=0x%02x "
-			          "stage=http clientid=%s username=%s ip=%s "
-			          "proto=%d (HTTP auth backend unavailable)",
-			    connack_reason_name(reject_reason), rv,
-			    log_clientid, log_username, log_ip,
-			    p->conn_param->pro_ver);
-		} else {
-			log_warn("CONNECT rejected: reason=%s code=0x%02x "
-			         "stage=%s clientid=%s username=%s ip=%s proto=%d",
-			    connack_reason_name(reject_reason), rv,
-			    http_attempted ? "http" : "local", log_clientid,
-			    log_username, log_ip, p->conn_param->pro_ver);
-		}
+		log_connect_rejected(p->conn_param, rv, http_attempted);
 		// Do not register a rejected connection or expose it to the app.
 		// Returning the auth error here makes the core close the transport
 		// before it can deliver CONNACK. Close in the send completion instead.
