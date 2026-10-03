@@ -307,8 +307,12 @@ out:
 }
 
 /**
- * NNG_HTTP_STATUS_OK returns CONNACK
- * otherwise disconnect
+ * HTTP 200 accepts the connection. A completed response with any other status
+ * below 500 is a denial (NOT_AUTHORIZED). No response at all (connect, write
+ * or read failure, timeout) or a 5xx means the backend could not decide, so the
+ * client gets NMQ_SERVER_UNAVAILABLE and may retry. This mirrors the split
+ * mosquitto-go-auth makes between a rejected user and a backend error.
+ * Both close the connection after a failure CONNACK.
  * */
 int
 nmq_auth_http_connect(conn_param *cparam, conf_auth_http *conf)
@@ -336,7 +340,13 @@ nmq_auth_http_connect(conn_param *cparam, conf_auth_http *conf)
 
 	int status = send_request(conf, &conf->auth_req, &auth_params);
 
-	return status == NNG_HTTP_STATUS_OK ? SUCCESS : NOT_AUTHORIZED;
+	if (status == NNG_HTTP_STATUS_OK) {
+		return SUCCESS;
+	}
+	if (status == 0 || status >= NNG_HTTP_STATUS_INTERNAL_SERVER_ERROR) {
+		return NMQ_SERVER_UNAVAILABLE;
+	}
+	return NOT_AUTHORIZED;
 }
 
 char *parse_topics(topic_queue *head)

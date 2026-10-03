@@ -75,8 +75,8 @@ void test_auth_http_connect(void)
 	NUTS_TRUE(conn_param != NULL);
 
 	int rc = nmq_auth_http_connect(conn_param, conf);
-	/* send_request will be failed */
-	NUTS_TRUE(rc != 0);
+	/* No HTTP response: the backend could not decide, which is not a denial. */
+	NUTS_TRUE(rc == NMQ_SERVER_UNAVAILABLE);
 
 	nng_mtx_free(conf->auth_req.mtx);
 	nng_free(conf->auth_req.url, strlen(conf->auth_req.url) + 1);
