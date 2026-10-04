@@ -6,8 +6,21 @@
 #include "nng/protocol/mqtt/mqtt_parser.h"
 #include "nng/supplemental/nanolib/conf.h"
 #include "nng/supplemental/nanolib/hash_table.h"
+#include "supplemental/http/http_api.h"
+#include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <string.h>
+
+#if defined(NNG_PLATFORM_POSIX)
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+#endif
 
 struct auth_http_params {
 	const char *access; // (1 - subscribe, 2 - publish)
@@ -217,6 +230,235 @@ set_data(
 	}
 }
 
+#if defined(NNG_PLATFORM_POSIX)
+// Auth and ACL checks run on nng task-queue threads (server_cb and the
+// protocol's pipe callbacks). Waiting there for an nng aio deadlocks under
+// load: the aio's own completion also needs a task-queue thread, so once every
+// thread is blocked in an auth call no reply can be processed and each call
+// runs into its timeout while the backend is healthy. Plain blocking sockets
+// need no other thread, so concurrent checks neither starve nor serialise.
+
+static uint64_t
+http_now_ms(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ((uint64_t) ts.tv_sec * 1000) + ((uint64_t) ts.tv_nsec / 1000000);
+}
+
+static int
+http_wait_fd(int fd, short events, uint64_t deadline)
+{
+	for (;;) {
+		uint64_t now = http_now_ms();
+		if (now >= deadline) {
+			return (NNG_ETIMEDOUT);
+		}
+		struct pollfd pfd = { .fd = fd, .events = events };
+		int           n   = poll(&pfd, 1, (int) (deadline - now));
+		if (n > 0) {
+			return (0);
+		}
+		if (n == 0) {
+			return (NNG_ETIMEDOUT);
+		}
+		if (errno != EINTR) {
+			return (NNG_ECLOSED);
+		}
+	}
+}
+
+static int
+http_connect(const char *host, const char *port, uint64_t deadline, int *fdp)
+{
+	struct addrinfo  hints = { 0 };
+	struct addrinfo *res   = NULL;
+	int              rv;
+
+	hints.ai_family   = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	if ((rv = getaddrinfo(host, port, &hints, &res)) != 0) {
+		log_error("Resolve %s failed: %s", host, gai_strerror(rv));
+		return (NNG_EADDRINVAL);
+	}
+	rv = NNG_ECONNREFUSED;
+	for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
+		int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+		if (fd < 0) {
+			continue;
+		}
+		(void) fcntl(fd, F_SETFD, FD_CLOEXEC);
+		(void) fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+#ifdef SO_NOSIGPIPE
+		int one = 1;
+		(void) setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+		if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
+			rv = 0;
+		} else if (errno == EINPROGRESS) {
+			if ((rv = http_wait_fd(fd, POLLOUT, deadline)) == 0) {
+				int       err = 0;
+				socklen_t len = sizeof(err);
+				if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0 ||
+				    err != 0) {
+					rv = NNG_ECONNREFUSED;
+				}
+			}
+		} else {
+			rv = NNG_ECONNREFUSED;
+		}
+		if (rv == 0) {
+			*fdp = fd;
+			break;
+		}
+		close(fd);
+		if (rv == NNG_ETIMEDOUT) {
+			break;
+		}
+	}
+	freeaddrinfo(res);
+	return (rv);
+}
+
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
+static int
+http_write_all(int fd, const char *buf, size_t len, uint64_t deadline)
+{
+	while (len > 0) {
+		ssize_t n = send(fd, buf, len, MSG_NOSIGNAL);
+		if (n > 0) {
+			buf += n;
+			len -= (size_t) n;
+		} else if (n < 0 && errno == EINTR) {
+			continue;
+		} else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+			int rv;
+			if ((rv = http_wait_fd(fd, POLLOUT, deadline)) != 0) {
+				return (rv);
+			}
+		} else {
+			return (NNG_ECLOSED);
+		}
+	}
+	return (0);
+}
+
+// Reads the status line ("HTTP/1.1 200 OK") into line and returns its code.
+static int
+http_read_status(
+    int fd, uint64_t deadline, char *line, size_t size, int *statusp)
+{
+	size_t got = 0;
+	char  *eol = NULL;
+
+	while ((eol = memchr(line, '\n', got)) == NULL) {
+		if (got == size - 1) {
+			return (NNG_EPROTO);
+		}
+		ssize_t n = recv(fd, line + got, size - 1 - got, 0);
+		if (n > 0) {
+			got += (size_t) n;
+		} else if (n == 0) {
+			return (NNG_ECLOSED);
+		} else if (errno == EINTR) {
+			continue;
+		} else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+			int rv;
+			if ((rv = http_wait_fd(fd, POLLIN, deadline)) != 0) {
+				return (rv);
+			}
+		} else {
+			return (NNG_ECLOSED);
+		}
+	}
+	*eol = '\0';
+	if (eol > line && eol[-1] == '\r') {
+		eol[-1] = '\0';
+	}
+	// "HTTP/1.x NNN ..."
+	if (strncmp(line, "HTTP/1.", 7) != 0 || strlen(line) < 12 ||
+	    line[8] != ' ' || !isdigit((unsigned char) line[9]) ||
+	    !isdigit((unsigned char) line[10]) ||
+	    !isdigit((unsigned char) line[11])) {
+		return (NNG_EPROTO);
+	}
+	*statusp = (line[9] - '0') * 100 + (line[10] - '0') * 10 + (line[11] - '0');
+	return (0);
+}
+
+// Returns the HTTP status, or 0 when no complete response arrived.
+static int
+send_request(conf_auth_http *conf, conf_auth_http_req *conf_req,
+    auth_http_params *params)
+{
+	nng_url      *url    = NULL;
+	nng_http_req *req    = NULL;
+	int           fd     = -1;
+	int           status = 0;
+	int           rv;
+	void         *head;
+	size_t        head_len;
+	void         *body;
+	size_t        body_len;
+	char          line[256];
+
+	if (((rv = nng_url_parse(&url, conf_req->url)) != 0) ||
+	    ((rv = nng_http_req_alloc(&req, url)) != 0)) {
+		log_error("Prepare request failed: %s", nng_strerror(rv));
+		goto out;
+	}
+	if (strcmp(url->u_scheme, "http") != 0) {
+		log_error("Unsupported auth URL scheme: %s", url->u_scheme);
+		goto out;
+	}
+	set_data(req, conf_req, params);
+	nng_http_req_set_header(req, "Connection", "close");
+	if ((rv = nni_http_req_get_buf((nni_http_req *) req, &head, &head_len)) !=
+	    0) {
+		log_error("Prepare request failed: %s", nng_strerror(rv));
+		goto out;
+	}
+	nni_http_req_get_data((nni_http_req *) req, &body, &body_len);
+
+	rv = http_connect(url->u_hostname, url->u_port,
+	    http_now_ms() + conf->connect_timeout * 1000, &fd);
+	if (rv != 0) {
+		log_error("Connect failed: %s", nng_strerror(rv));
+		goto out;
+	}
+
+	uint64_t deadline = http_now_ms() + conf->timeout * 1000;
+	if (((rv = http_write_all(fd, head, head_len, deadline)) != 0) ||
+	    ((rv = http_write_all(fd, body, body_len, deadline)) != 0)) {
+		log_error("Write req failed: %s", nng_strerror(rv));
+		goto out;
+	}
+	if ((rv = http_read_status(fd, deadline, line, sizeof(line), &status)) !=
+	    0) {
+		log_error("Read response: %s", nng_strerror(rv));
+		status = 0;
+		goto out;
+	}
+	if (status != NNG_HTTP_STATUS_OK) {
+		log_error("HTTP Server Responded: %s", line);
+	}
+
+out:
+	if (fd >= 0) {
+		close(fd);
+	}
+	if (req) {
+		nng_http_req_free(req);
+	}
+	if (url) {
+		nng_url_free(url);
+	}
+	return status;
+}
+#else
 static int
 send_request(conf_auth_http *conf, conf_auth_http_req *conf_req,
     auth_http_params *params)
@@ -305,6 +547,8 @@ out:
 	nng_mtx_unlock(conf_req->mtx);
 	return status;
 }
+
+#endif // NNG_PLATFORM_POSIX
 
 /**
  * HTTP 200 accepts the connection. A completed response with any other status
