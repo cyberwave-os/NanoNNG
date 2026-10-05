@@ -156,7 +156,7 @@ struct conf_auth_http_req {
 	conf_http_header **headers;
 	size_t             param_count;
 	conf_http_param  **params;
-	// TODO not support yet
+	// Used for an https url; only cacertfile is honoured.
 	conf_tls tls;
 };
 

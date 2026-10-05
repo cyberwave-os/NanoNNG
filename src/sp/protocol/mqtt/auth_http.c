@@ -20,6 +20,20 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(NNG_TLS_ENGINE_MBEDTLS)
+#include "mbedtls/version.h" // Must be first in order to pick up version
+#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/entropy.h"
+#include "mbedtls/error.h"
+#include "mbedtls/ssl.h"
+#include "mbedtls/x509_crt.h"
+// For MBEDTLS_ERR_NET_*; mbedTLS renamed this header for 2.4.0.
+#if MBEDTLS_VERSION_MAJOR > 2 || MBEDTLS_VERSION_MINOR >= 4
+#include "mbedtls/net_sockets.h"
+#else
+#include "mbedtls/net.h"
+#endif
+#endif
 #endif
 
 struct auth_http_params {
@@ -324,11 +338,238 @@ http_connect(const char *host, const char *port, uint64_t deadline, int *fdp)
 #define MSG_NOSIGNAL 0
 #endif
 
+// A connection to the backend: the socket, plus the TLS session when the
+// callback URL is https. TLS runs over the same non-blocking socket and the
+// same poll() deadlines, so it keeps the no-extra-thread property above.
+typedef struct {
+	int fd;
+#if defined(NNG_TLS_ENGINE_MBEDTLS)
+	bool                     tls;
+	mbedtls_ssl_context      ssl;
+	mbedtls_ssl_config       cfg;
+	mbedtls_x509_crt         ca;
+	mbedtls_entropy_context  entropy;
+	mbedtls_ctr_drbg_context drbg;
+#endif
+} http_io;
+
+#if defined(NNG_TLS_ENGINE_MBEDTLS)
+
+// mbedTLS BIO callbacks. The socket is non-blocking, so "would block" becomes
+// WANT_READ/WANT_WRITE and the caller waits on the request deadline. These
+// mirror mbedtls_net_send/mbedtls_net_recv, including returning 0 at EOF.
 static int
-http_write_all(int fd, const char *buf, size_t len, uint64_t deadline)
+http_tls_send(void *ctx, const unsigned char *buf, size_t len)
+{
+	ssize_t n = send(*(int *) ctx, buf, len, MSG_NOSIGNAL);
+	if (n >= 0) {
+		return ((int) n);
+	}
+	if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+		return (MBEDTLS_ERR_SSL_WANT_WRITE);
+	}
+	return (MBEDTLS_ERR_NET_SEND_FAILED);
+}
+
+static int
+http_tls_recv(void *ctx, unsigned char *buf, size_t len)
+{
+	ssize_t n = recv(*(int *) ctx, buf, len, 0);
+	if (n >= 0) {
+		return ((int) n);
+	}
+	if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+		return (MBEDTLS_ERR_SSL_WANT_READ);
+	}
+	return (MBEDTLS_ERR_NET_RECV_FAILED);
+}
+
+// Waits for whichever direction mbedTLS asked for. Returns NNG_EPROTO for any
+// result that is not a wait, so the caller can report the original error.
+static int
+http_tls_wait(http_io *io, int want, uint64_t deadline)
+{
+	if (want == MBEDTLS_ERR_SSL_WANT_READ) {
+		return (http_wait_fd(io->fd, POLLIN, deadline));
+	}
+	if (want == MBEDTLS_ERR_SSL_WANT_WRITE) {
+		return (http_wait_fd(io->fd, POLLOUT, deadline));
+	}
+	return (NNG_EPROTO);
+}
+
+// An explicit `ssl { cacertfile = ... }` on the request pins the trust anchor;
+// the config parser has already read that file into tls.ca. Otherwise the
+// platform CA bundle is used, so a backend behind a public certificate needs
+// no broker configuration at all.
+static int
+http_tls_trust(mbedtls_x509_crt *ca, conf_auth_http_req *conf_req)
+{
+	const char *file;
+	const char *dir;
+	int         rv;
+
+	if (conf_req->tls.ca != NULL) {
+		rv = mbedtls_x509_crt_parse(ca,
+		    (const unsigned char *) conf_req->tls.ca,
+		    strlen(conf_req->tls.ca) + 1);
+		if (rv != 0) {
+			log_error("Parse cacertfile %s failed: -0x%04x",
+			    conf_req->tls.cafile ? conf_req->tls.cafile : "",
+			    -rv);
+			return (NNG_EINVAL);
+		}
+		return (0);
+	}
+	if ((file = getenv("SSL_CERT_FILE")) == NULL) {
+		file = "/etc/ssl/certs/ca-certificates.crt";
+	}
+	if (mbedtls_x509_crt_parse_file(ca, file) == 0) {
+		return (0);
+	}
+	if ((dir = getenv("SSL_CERT_DIR")) == NULL) {
+		dir = "/etc/ssl/certs";
+	}
+	if ((rv = mbedtls_x509_crt_parse_path(ca, dir)) < 0) {
+		log_error("No CA certificates in %s or %s: set the auth "
+		          "request's ssl.cacertfile",
+		    file, dir);
+		return (NNG_ENOENT);
+	}
+	return (0);
+}
+
+static void
+http_tls_log_error(http_io *io, const char *host, int rv)
+{
+	char info[256];
+
+	if (rv == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED) {
+		uint32_t flags = mbedtls_ssl_get_verify_result(&io->ssl);
+		if (mbedtls_x509_crt_verify_info(
+		        info, sizeof(info), "", flags) > 0) {
+			char *eol = strchr(info, '\n');
+			if (eol != NULL) {
+				*eol = '\0';
+			}
+			log_error("TLS certificate of %s rejected: %s", host,
+			    info);
+			return;
+		}
+	}
+	mbedtls_strerror(rv, info, sizeof(info));
+	log_error("TLS handshake with %s failed: %s", host, info);
+}
+
+// Seeds, configures and completes the handshake. The server certificate is
+// always verified against the trust anchors and the hostname: these callbacks
+// carry client credentials, so an unverified peer is not an option.
+static int
+http_tls_start(http_io *io, const char *host, conf_auth_http_req *conf_req,
+    uint64_t deadline)
+{
+	static const char personal[] = "nanomq-auth-http";
+	int               rv;
+
+	mbedtls_ssl_init(&io->ssl);
+	mbedtls_ssl_config_init(&io->cfg);
+	mbedtls_x509_crt_init(&io->ca);
+	mbedtls_entropy_init(&io->entropy);
+	mbedtls_ctr_drbg_init(&io->drbg);
+	io->tls = true; // every context above is now owned by http_io_fini
+
+	if ((rv = mbedtls_ctr_drbg_seed(&io->drbg, mbedtls_entropy_func,
+	         &io->entropy, (const unsigned char *) personal,
+	         sizeof(personal) - 1)) != 0) {
+		log_error("Seed TLS random generator failed: -0x%04x", -rv);
+		return (NNG_ECRYPTO);
+	}
+	if ((rv = http_tls_trust(&io->ca, conf_req)) != 0) {
+		return (rv);
+	}
+	if ((rv = mbedtls_ssl_config_defaults(&io->cfg, MBEDTLS_SSL_IS_CLIENT,
+	         MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT)) !=
+	    0) {
+		log_error("Configure TLS client failed: -0x%04x", -rv);
+		return (NNG_ECRYPTO);
+	}
+	mbedtls_ssl_conf_authmode(&io->cfg, MBEDTLS_SSL_VERIFY_REQUIRED);
+	mbedtls_ssl_conf_ca_chain(&io->cfg, &io->ca, NULL);
+	mbedtls_ssl_conf_rng(&io->cfg, mbedtls_ctr_drbg_random, &io->drbg);
+	if ((rv = mbedtls_ssl_setup(&io->ssl, &io->cfg)) != 0) {
+		log_error("Set up TLS session failed: -0x%04x", -rv);
+		return (NNG_ECRYPTO);
+	}
+	// Also sends SNI, which a shared front end needs to pick a certificate.
+	if ((rv = mbedtls_ssl_set_hostname(&io->ssl, host)) != 0) {
+		log_error("Set TLS hostname failed: -0x%04x", -rv);
+		return (NNG_ECRYPTO);
+	}
+	mbedtls_ssl_set_bio(
+	    &io->ssl, &io->fd, http_tls_send, http_tls_recv, NULL);
+
+	for (;;) {
+		int wrv;
+		if ((rv = mbedtls_ssl_handshake(&io->ssl)) == 0) {
+			return (0);
+		}
+		if ((wrv = http_tls_wait(io, rv, deadline)) == NNG_EPROTO) {
+			http_tls_log_error(io, host, rv);
+			return (rv == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED
+			        ? NNG_EPEERAUTH
+			        : NNG_ECLOSED);
+		}
+		if (wrv != 0) {
+			log_error("TLS handshake with %s: %s", host,
+			    nng_strerror(wrv));
+			return (wrv);
+		}
+	}
+}
+#endif // NNG_TLS_ENGINE_MBEDTLS
+
+static void
+http_io_fini(http_io *io)
+{
+#if defined(NNG_TLS_ENGINE_MBEDTLS)
+	if (io->tls) {
+		(void) mbedtls_ssl_close_notify(&io->ssl); // best effort
+		mbedtls_ssl_free(&io->ssl);
+		mbedtls_ssl_config_free(&io->cfg);
+		mbedtls_x509_crt_free(&io->ca);
+		mbedtls_ctr_drbg_free(&io->drbg);
+		mbedtls_entropy_free(&io->entropy);
+		io->tls = false;
+	}
+#endif
+	if (io->fd >= 0) {
+		close(io->fd);
+		io->fd = -1;
+	}
+}
+
+static int
+http_io_write(http_io *io, const char *buf, size_t len, uint64_t deadline)
 {
 	while (len > 0) {
-		ssize_t n = send(fd, buf, len, MSG_NOSIGNAL);
+		ssize_t n;
+#if defined(NNG_TLS_ENGINE_MBEDTLS)
+		if (io->tls) {
+			int rv, wrv;
+			rv = mbedtls_ssl_write(
+			    &io->ssl, (const unsigned char *) buf, len);
+			if (rv > 0) {
+				buf += rv;
+				len -= (size_t) rv;
+				continue;
+			}
+			if ((wrv = http_tls_wait(io, rv, deadline)) != 0) {
+				return (wrv == NNG_EPROTO ? NNG_ECLOSED : wrv);
+			}
+			continue;
+		}
+#endif
+		n = send(io->fd, buf, len, MSG_NOSIGNAL);
 		if (n > 0) {
 			buf += n;
 			len -= (size_t) n;
@@ -336,7 +577,7 @@ http_write_all(int fd, const char *buf, size_t len, uint64_t deadline)
 			continue;
 		} else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
 			int rv;
-			if ((rv = http_wait_fd(fd, POLLOUT, deadline)) != 0) {
+			if ((rv = http_wait_fd(io->fd, POLLOUT, deadline)) != 0) {
 				return (rv);
 			}
 		} else {
@@ -346,33 +587,69 @@ http_write_all(int fd, const char *buf, size_t len, uint64_t deadline)
 	return (0);
 }
 
+// Reads at least one byte. NNG_ECLOSED reports the peer closing the stream.
+static int
+http_io_read(
+    http_io *io, char *buf, size_t len, uint64_t deadline, size_t *gotp)
+{
+	for (;;) {
+		ssize_t n;
+#if defined(NNG_TLS_ENGINE_MBEDTLS)
+		if (io->tls) {
+			int rv, wrv;
+			rv = mbedtls_ssl_read(
+			    &io->ssl, (unsigned char *) buf, len);
+			if (rv > 0) {
+				*gotp = (size_t) rv;
+				return (0);
+			}
+			if ((wrv = http_tls_wait(io, rv, deadline)) != 0) {
+				return (wrv == NNG_EPROTO ? NNG_ECLOSED : wrv);
+			}
+			continue;
+		}
+#endif
+		n = recv(io->fd, buf, len, 0);
+		if (n > 0) {
+			*gotp = (size_t) n;
+			return (0);
+		}
+		if (n == 0) {
+			return (NNG_ECLOSED);
+		}
+		if (errno == EINTR) {
+			continue;
+		}
+		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+			int rv;
+			if ((rv = http_wait_fd(io->fd, POLLIN, deadline)) != 0) {
+				return (rv);
+			}
+			continue;
+		}
+		return (NNG_ECLOSED);
+	}
+}
+
 // Reads the status line ("HTTP/1.1 200 OK") into line and returns its code.
 static int
 http_read_status(
-    int fd, uint64_t deadline, char *line, size_t size, int *statusp)
+    http_io *io, uint64_t deadline, char *line, size_t size, int *statusp)
 {
 	size_t got = 0;
 	char  *eol = NULL;
 
 	while ((eol = memchr(line, '\n', got)) == NULL) {
+		size_t n;
+		int    rv;
 		if (got == size - 1) {
 			return (NNG_EPROTO);
 		}
-		ssize_t n = recv(fd, line + got, size - 1 - got, 0);
-		if (n > 0) {
-			got += (size_t) n;
-		} else if (n == 0) {
-			return (NNG_ECLOSED);
-		} else if (errno == EINTR) {
-			continue;
-		} else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-			int rv;
-			if ((rv = http_wait_fd(fd, POLLIN, deadline)) != 0) {
-				return (rv);
-			}
-		} else {
-			return (NNG_ECLOSED);
+		if ((rv = http_io_read(
+		         io, line + got, size - 1 - got, deadline, &n)) != 0) {
+			return (rv);
 		}
+		got += n;
 	}
 	*eol = '\0';
 	if (eol > line && eol[-1] == '\r') {
@@ -396,8 +673,11 @@ send_request(conf_auth_http *conf, conf_auth_http_req *conf_req,
 {
 	nng_url      *url    = NULL;
 	nng_http_req *req    = NULL;
-	int           fd     = -1;
+	http_io       io     = { .fd = -1 };
 	int           status = 0;
+#if defined(NNG_TLS_ENGINE_MBEDTLS)
+	bool          secure = false;
+#endif
 	int           rv;
 	void         *head;
 	size_t        head_len;
@@ -410,7 +690,14 @@ send_request(conf_auth_http *conf, conf_auth_http_req *conf_req,
 		log_error("Prepare request failed: %s", nng_strerror(rv));
 		goto out;
 	}
-	if (strcmp(url->u_scheme, "http") != 0) {
+	if (strcmp(url->u_scheme, "https") == 0) {
+#if defined(NNG_TLS_ENGINE_MBEDTLS)
+		secure = true;
+#else
+		log_error("Auth URL scheme https needs a TLS-enabled build");
+		goto out;
+#endif
+	} else if (strcmp(url->u_scheme, "http") != 0) {
 		log_error("Unsupported auth URL scheme: %s", url->u_scheme);
 		goto out;
 	}
@@ -424,19 +711,29 @@ send_request(conf_auth_http *conf, conf_auth_http_req *conf_req,
 	nni_http_req_get_data((nni_http_req *) req, &body, &body_len);
 
 	rv = http_connect(url->u_hostname, url->u_port,
-	    http_now_ms() + conf->connect_timeout * 1000, &fd);
+	    http_now_ms() + conf->connect_timeout * 1000, &io.fd);
 	if (rv != 0) {
 		log_error("Connect failed: %s", nng_strerror(rv));
 		goto out;
 	}
 
+#if defined(NNG_TLS_ENGINE_MBEDTLS)
+	// The handshake is part of establishing the connection, so it gets its
+	// own connect_timeout: a peer that accepts the socket but never
+	// finishes TLS must not hold a worker thread for the request timeout.
+	if (secure &&
+	    (rv = http_tls_start(&io, url->u_hostname, conf_req,
+	         http_now_ms() + conf->connect_timeout * 1000)) != 0) {
+		goto out;
+	}
+#endif
 	uint64_t deadline = http_now_ms() + conf->timeout * 1000;
-	if (((rv = http_write_all(fd, head, head_len, deadline)) != 0) ||
-	    ((rv = http_write_all(fd, body, body_len, deadline)) != 0)) {
+	if (((rv = http_io_write(&io, head, head_len, deadline)) != 0) ||
+	    ((rv = http_io_write(&io, body, body_len, deadline)) != 0)) {
 		log_error("Write req failed: %s", nng_strerror(rv));
 		goto out;
 	}
-	if ((rv = http_read_status(fd, deadline, line, sizeof(line), &status)) !=
+	if ((rv = http_read_status(&io, deadline, line, sizeof(line), &status)) !=
 	    0) {
 		log_error("Read response: %s", nng_strerror(rv));
 		status = 0;
@@ -447,9 +744,7 @@ send_request(conf_auth_http *conf, conf_auth_http_req *conf_req,
 	}
 
 out:
-	if (fd >= 0) {
-		close(fd);
-	}
+	http_io_fini(&io);
 	if (req) {
 		nng_http_req_free(req);
 	}

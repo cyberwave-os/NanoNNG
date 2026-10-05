@@ -141,8 +141,105 @@ void test_auth_http_sub_pub(void)
 	return;
 }
 
+#ifdef NNG_SUPP_TLS
+
+static void
+reply_ok(nng_aio *aio)
+{
+	nng_http_res *res;
+	int           rv;
+
+	if ((rv = nng_http_res_alloc(&res)) != 0) {
+		nng_aio_finish(aio, rv);
+		return;
+	}
+	nng_http_res_set_status(res, NNG_HTTP_STATUS_OK);
+	nng_aio_set_output(aio, 0, res);
+	nng_aio_finish(aio, 0);
+}
+
+/* An HTTPS backend on localhost that grants every request it answers. The
+ * nuts server certificate is self-signed for CN=localhost, so it doubles as
+ * the trust anchor a caller configures. */
+static void
+https_backend_start(nng_http_server **srvp, uint16_t port)
+{
+	nng_http_handler *handler;
+	nng_tls_config   *cfg;
+	nng_url          *url;
+	char              addr[64];
+
+	snprintf(addr, sizeof(addr), "https://localhost:%u", port);
+	NUTS_PASS(nng_url_parse(&url, addr));
+	NUTS_PASS(nng_http_server_hold(srvp, url));
+	NUTS_PASS(nng_tls_config_alloc(&cfg, NNG_TLS_MODE_SERVER));
+	NUTS_PASS(nng_tls_config_own_cert(
+	    cfg, nuts_server_crt, nuts_server_key, NULL));
+	NUTS_PASS(nng_http_server_set_tls(*srvp, cfg));
+	nng_tls_config_free(cfg);
+	NUTS_PASS(nng_http_handler_alloc(&handler, "/mqtt/auth", reply_ok));
+	NUTS_PASS(nng_http_server_add_handler(*srvp, handler));
+	NUTS_PASS(nng_http_server_start(*srvp));
+	nng_url_free(url);
+}
+
+static void
+auth_http_connect_over_tls(const char *ca, int expect)
+{
+	conf_auth_http  *conf = NULL;
+	conn_param      *cp   = NULL;
+	nng_http_server *srv  = NULL;
+	uint16_t         port = nuts_next_port();
+	char             url[64];
+
+	conf_auth_http_init(&conf);
+	NUTS_TRUE(conf != NULL);
+	conf->connect_timeout = 5;
+	conf->timeout         = 5;
+	snprintf(url, sizeof(url), "https://localhost:%u/mqtt/auth", port);
+	conf->auth_req.url    = nng_strdup(url);
+	conf->auth_req.tls.ca = nng_strdup(ca);
+	nng_mtx_alloc(&conf->auth_req.mtx);
+
+	conn_param_init(&cp);
+	NUTS_TRUE(cp != NULL);
+
+	https_backend_start(&srv, port);
+	NUTS_TRUE(nmq_auth_http_connect(cp, conf) == expect);
+
+	nng_http_server_stop(srv);
+	nng_http_server_release(srv);
+	nng_mtx_free(conf->auth_req.mtx);
+	nng_strfree(conf->auth_req.url);
+	nng_strfree(conf->auth_req.tls.ca);
+	nng_free(conf, sizeof(conf_auth_http));
+	conn_param_free(cp);
+}
+
+/* Production reaches the backend over https, so the plain-socket client has to
+ * speak it; cacertfile is the trust anchor the config parser loaded. */
+void test_auth_http_connect_tls(void)
+{
+	auth_http_connect_over_tls(nuts_server_crt, SUCCESS);
+}
+
+/* The request carries the broker's credentials, so a certificate that does not
+ * chain to the configured anchor has to stop it -- and that is the backend
+ * failing to answer, not the client failing to authenticate. */
+void test_auth_http_connect_tls_untrusted(void)
+{
+	auth_http_connect_over_tls(nuts_client_crt, NMQ_SERVER_UNAVAILABLE);
+}
+
+#endif // NNG_SUPP_TLS
+
 NUTS_TESTS = {
 	{ "auth_http_connect", test_auth_http_connect },
 	{ "auth_http_sub_pub", test_auth_http_sub_pub },
+#ifdef NNG_SUPP_TLS
+	{ "auth_http_connect_tls", test_auth_http_connect_tls },
+	{ "auth_http_connect_tls_untrusted",
+	    test_auth_http_connect_tls_untrusted },
+#endif
 	{ NULL, NULL },
 };
