@@ -17,6 +17,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -347,7 +348,6 @@ typedef struct {
 	bool                     tls;
 	mbedtls_ssl_context      ssl;
 	mbedtls_ssl_config       cfg;
-	mbedtls_x509_crt         ca;
 	mbedtls_entropy_context  entropy;
 	mbedtls_ctr_drbg_context drbg;
 #endif
@@ -398,14 +398,32 @@ http_tls_wait(http_io *io, int want, uint64_t deadline)
 	return (NNG_EPROTO);
 }
 
+// Identifies the trust anchor by what it is rather than by where it is stored,
+// so that a reloaded configuration at the same address, or two requests sharing
+// one anchor, resolve correctly: either the certificates themselves, or the
+// path of the platform bundle they are read from.
+static const char *
+http_tls_trust_key(conf_auth_http_req *conf_req)
+{
+	const char *file;
+
+	if (conf_req->tls.ca != NULL) {
+		return (conf_req->tls.ca);
+	}
+	if ((file = getenv("SSL_CERT_FILE")) == NULL) {
+		file = "/etc/ssl/certs/ca-certificates.crt";
+	}
+	return (file);
+}
+
 // An explicit `ssl { cacertfile = ... }` on the request pins the trust anchor;
 // the config parser has already read that file into tls.ca. Otherwise the
 // platform CA bundle is used, so a backend behind a public certificate needs
 // no broker configuration at all.
 static int
-http_tls_trust(mbedtls_x509_crt *ca, conf_auth_http_req *conf_req)
+http_tls_trust_parse(
+    mbedtls_x509_crt *ca, conf_auth_http_req *conf_req, const char *file)
 {
-	const char *file;
 	const char *dir;
 	int         rv;
 
@@ -421,9 +439,6 @@ http_tls_trust(mbedtls_x509_crt *ca, conf_auth_http_req *conf_req)
 		}
 		return (0);
 	}
-	if ((file = getenv("SSL_CERT_FILE")) == NULL) {
-		file = "/etc/ssl/certs/ca-certificates.crt";
-	}
 	if (mbedtls_x509_crt_parse_file(ca, file) == 0) {
 		return (0);
 	}
@@ -436,6 +451,63 @@ http_tls_trust(mbedtls_x509_crt *ca, conf_auth_http_req *conf_req)
 		    file, dir);
 		return (NNG_ENOENT);
 	}
+	return (0);
+}
+
+// Parsed anchors, kept for the life of the process and reachable from the
+// list head so a leak checker can still account for them. Entries are only
+// added, never replaced, because a handshake that is already running holds a
+// pointer into one.
+typedef struct http_tls_anchor {
+	struct http_tls_anchor *next;
+	char                   *key;
+	mbedtls_x509_crt        ca;
+} http_tls_anchor;
+
+static pthread_mutex_t  http_tls_anchor_lk = PTHREAD_MUTEX_INITIALIZER;
+static http_tls_anchor *http_tls_anchors;
+
+// Returns the shared chain for this request's anchor, parsing it on first use.
+// The anchor does not change while the broker runs and the handshake only
+// reads it, so one parse serves every request: mbedtls_ssl_conf_ca_chain keeps
+// a pointer rather than a copy. Parsing it per request instead re-reads the
+// whole CA bundle on every callback that the ACL cache does not cover, which
+// is every CONNECT and every denied publish.
+static int
+http_tls_trust(mbedtls_x509_crt **ca, conf_auth_http_req *conf_req)
+{
+	http_tls_anchor *anchor;
+	const char      *key = http_tls_trust_key(conf_req);
+	int              rv;
+
+	pthread_mutex_lock(&http_tls_anchor_lk);
+	for (anchor = http_tls_anchors; anchor != NULL; anchor = anchor->next) {
+		if (strcmp(anchor->key, key) == 0) {
+			pthread_mutex_unlock(&http_tls_anchor_lk);
+			*ca = &anchor->ca;
+			return (0);
+		}
+	}
+	if ((anchor = calloc(1, sizeof(*anchor))) == NULL ||
+	    (anchor->key = nng_strdup(key)) == NULL) {
+		free(anchor);
+		pthread_mutex_unlock(&http_tls_anchor_lk);
+		return (NNG_ENOMEM);
+	}
+	mbedtls_x509_crt_init(&anchor->ca);
+	// A failure is not cached: it can be a missing file that later appears,
+	// and the next callback should see that rather than the stale result.
+	if ((rv = http_tls_trust_parse(&anchor->ca, conf_req, key)) != 0) {
+		mbedtls_x509_crt_free(&anchor->ca);
+		nng_strfree(anchor->key);
+		free(anchor);
+		pthread_mutex_unlock(&http_tls_anchor_lk);
+		return (rv);
+	}
+	anchor->next     = http_tls_anchors;
+	http_tls_anchors = anchor;
+	pthread_mutex_unlock(&http_tls_anchor_lk);
+	*ca = &anchor->ca;
 	return (0);
 }
 
@@ -469,11 +541,11 @@ http_tls_start(http_io *io, const char *host, conf_auth_http_req *conf_req,
     uint64_t deadline)
 {
 	static const char personal[] = "nanomq-auth-http";
+	mbedtls_x509_crt *ca;
 	int               rv;
 
 	mbedtls_ssl_init(&io->ssl);
 	mbedtls_ssl_config_init(&io->cfg);
-	mbedtls_x509_crt_init(&io->ca);
 	mbedtls_entropy_init(&io->entropy);
 	mbedtls_ctr_drbg_init(&io->drbg);
 	io->tls = true; // every context above is now owned by http_io_fini
@@ -484,7 +556,7 @@ http_tls_start(http_io *io, const char *host, conf_auth_http_req *conf_req,
 		log_error("Seed TLS random generator failed: -0x%04x", -rv);
 		return (NNG_ECRYPTO);
 	}
-	if ((rv = http_tls_trust(&io->ca, conf_req)) != 0) {
+	if ((rv = http_tls_trust(&ca, conf_req)) != 0) {
 		return (rv);
 	}
 	if ((rv = mbedtls_ssl_config_defaults(&io->cfg, MBEDTLS_SSL_IS_CLIENT,
@@ -494,7 +566,7 @@ http_tls_start(http_io *io, const char *host, conf_auth_http_req *conf_req,
 		return (NNG_ECRYPTO);
 	}
 	mbedtls_ssl_conf_authmode(&io->cfg, MBEDTLS_SSL_VERIFY_REQUIRED);
-	mbedtls_ssl_conf_ca_chain(&io->cfg, &io->ca, NULL);
+	mbedtls_ssl_conf_ca_chain(&io->cfg, ca, NULL);
 	mbedtls_ssl_conf_rng(&io->cfg, mbedtls_ctr_drbg_random, &io->drbg);
 	if ((rv = mbedtls_ssl_setup(&io->ssl, &io->cfg)) != 0) {
 		log_error("Set up TLS session failed: -0x%04x", -rv);
@@ -536,7 +608,6 @@ http_io_fini(http_io *io)
 		(void) mbedtls_ssl_close_notify(&io->ssl); // best effort
 		mbedtls_ssl_free(&io->ssl);
 		mbedtls_ssl_config_free(&io->cfg);
-		mbedtls_x509_crt_free(&io->ca);
 		mbedtls_ctr_drbg_free(&io->drbg);
 		mbedtls_entropy_free(&io->entropy);
 		io->tls = false;

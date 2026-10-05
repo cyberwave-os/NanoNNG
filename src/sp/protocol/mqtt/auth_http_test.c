@@ -141,7 +141,7 @@ void test_auth_http_sub_pub(void)
 	return;
 }
 
-#ifdef NNG_SUPP_TLS
+#if defined(NNG_SUPP_TLS) && defined(NNG_TLS_ENGINE_MBEDTLS)
 
 static void
 reply_ok(nng_aio *aio)
@@ -231,15 +231,30 @@ void test_auth_http_connect_tls_untrusted(void)
 	auth_http_connect_over_tls(nuts_client_crt, NMQ_SERVER_UNAVAILABLE);
 }
 
-#endif // NNG_SUPP_TLS
+/* The parsed anchor is shared between requests, so it has to be keyed by the
+ * certificates and not by the configuration that carried them: these three
+ * calls free and reallocate the configuration, which can hand the next one the
+ * same address. Alternating anchors catches a cache that answers for the
+ * previous one -- in either direction, since trusting too much and trusting
+ * too little are both wrong. */
+void test_auth_http_connect_tls_anchor_switch(void)
+{
+	auth_http_connect_over_tls(nuts_server_crt, SUCCESS);
+	auth_http_connect_over_tls(nuts_client_crt, NMQ_SERVER_UNAVAILABLE);
+	auth_http_connect_over_tls(nuts_server_crt, SUCCESS);
+}
+
+#endif // NNG_SUPP_TLS && NNG_TLS_ENGINE_MBEDTLS
 
 NUTS_TESTS = {
 	{ "auth_http_connect", test_auth_http_connect },
 	{ "auth_http_sub_pub", test_auth_http_sub_pub },
-#ifdef NNG_SUPP_TLS
+#if defined(NNG_SUPP_TLS) && defined(NNG_TLS_ENGINE_MBEDTLS)
 	{ "auth_http_connect_tls", test_auth_http_connect_tls },
 	{ "auth_http_connect_tls_untrusted",
 	    test_auth_http_connect_tls_untrusted },
+	{ "auth_http_connect_tls_anchor_switch",
+	    test_auth_http_connect_tls_anchor_switch },
 #endif
 	{ NULL, NULL },
 };
