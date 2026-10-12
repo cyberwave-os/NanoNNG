@@ -28,6 +28,10 @@ NNG_DECL int nng_nmq_tcp0_open(nng_socket *);
 #define NMQ_OPT_MQTT_PIPES "mqtt-clients-pipes"
 #define NMQ_OPT_MQTT_QOS_DB "mqtt-clients-qos-db"
 
+// PUBLISH messages accepted but lost before delivery (send queue overflow,
+// connection gone). Lock-free; safe to call from any thread.
+NNG_DECL uint64_t nmq_msgs_lost(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -350,6 +350,18 @@ nano_ctx_cancel_send(nni_aio *aio, void *arg, int rv)
 	nni_aio_finish_error(aio, rv);
 }
 
+// PUBLISH messages the broker accepted but could not deliver: a subscriber's
+// send queue overflowed, or its connection was gone with no session to cache
+// the message for. Not "no subscriber": that is decided before delivery.
+// Static storage is zero-initialised, which is a valid empty counter.
+static nni_atomic_u64 msgs_lost;
+
+uint64_t
+nmq_msgs_lost(void)
+{
+	return nni_atomic_get64(&msgs_lost);
+}
+
 static void
 nano_ctx_send(void *arg, nni_aio *aio)
 {
@@ -412,6 +424,9 @@ nano_ctx_send(void *arg, nni_aio *aio)
 		nni_aio_set_msg(aio, NULL);
 		if (qos_db == NULL) {
 			log_debug("pipe id %u is gone, pub failed", pipe);
+			if (nni_msg_get_type(msg) == CMD_PUBLISH) {
+				nni_atomic_inc64(&msgs_lost);
+			}
 		}
 		nni_msg_free(msg);
 		return;
@@ -446,6 +461,7 @@ nano_ctx_send(void *arg, nni_aio *aio)
 				nni_msg *old;
 				nni_lmq_get(&p->rlmq, &old);
 				nni_msg_free(old);
+				nni_atomic_inc64(&msgs_lost);
 			}
 		} else {
 			rotate2 ++;
@@ -455,6 +471,7 @@ nano_ctx_send(void *arg, nni_aio *aio)
 				rotate2 = rotate2 >> LOG_REDUCE_FACTOR;
 			}
 
+			nni_atomic_inc64(&msgs_lost);
 			nni_msg_free(msg);
 			nni_mtx_unlock(&p->lk);
 			nni_aio_set_msg(aio, NULL);
