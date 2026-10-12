@@ -39,8 +39,7 @@ struct dbtree_node {
 
 // Number of (topic filter, pipe) subscriptions across all dbtrees. The broker
 // keeps a single subscription tree, so a process-wide counter is enough.
-// Static storage is zero-initialised; dbtree_create() re-inits it before any
-// subscription can exist.
+// Static storage is zero-initialised, which is a valid empty counter.
 static nni_atomic_u64 g_sub_cnt;
 
 uint64_t
@@ -485,7 +484,6 @@ dbtree_create(dbtree **db)
 	(*db)->root       = node;
 	nni_rwlock_init(&(*db)->rwlock);
 	nni_atomic_init64(&(*db)->retain_cnt);
-	nni_atomic_init64(&g_sub_cnt);
 #ifdef RANDOM
 	srand(time(NULL));
 #endif
@@ -1117,10 +1115,17 @@ insert_dbtree_retain(dbtree_node *node, void *args)
 
 // $SYS topics are retained broker-internal state, not user data: they stay out
 // of the retained message count.
-static bool
-is_sys_topic(const char *topic)
+static void
+retain_cnt_adjust(dbtree *db, const char *topic, bool added)
 {
-	return strncmp(topic, "$SYS/", 5) == 0;
+	if (strncmp(topic, "$SYS/", 5) == 0) {
+		return;
+	}
+	if (added) {
+		nni_atomic_inc64(&db->retain_cnt);
+	} else {
+		nni_atomic_sub64(&db->retain_cnt, 1);
+	}
 }
 
 nng_msg *
@@ -1130,9 +1135,9 @@ dbtree_insert_retain(dbtree *db, char *topic, nng_msg *ret_msg)
 	    search_insert_node(db, topic, ret_msg, insert_dbtree_retain);
 	// insert_dbtree_retain returns the message it replaced: NULL means this
 	// topic had no retained message before, i.e. the count grows by one.
-	if (db != NULL && topic != NULL && ret_msg != NULL && old == NULL &&
-	    !is_sys_topic(topic)) {
-		nni_atomic_inc64(&db->retain_cnt);
+	// search_insert_node returns NULL early for a NULL tree or topic.
+	if (db != NULL && topic != NULL && ret_msg != NULL && old == NULL) {
+		retain_cnt_adjust(db, topic, true);
 	}
 	return old;
 }
@@ -1383,8 +1388,8 @@ dbtree_delete_retain(dbtree *db, char *topic)
 
 	if (node->child) {
 		ret = delete_dbtree_retain(node->child[index]);
-		if (ret != NULL && !is_sys_topic(topic)) {
-			nni_atomic_sub64(&db->retain_cnt, 1);
+		if (ret != NULL) {
+			retain_cnt_adjust(db, topic, false);
 		}
 		// print_client(node->child[index]->clients);
 		delete_dbtree_node(node, index);
