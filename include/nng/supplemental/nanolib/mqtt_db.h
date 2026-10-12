@@ -110,6 +110,13 @@ NNG_DECL nng_msg *dbtree_insert_retain(
 NNG_DECL nng_msg *dbtree_delete_retain(dbtree *db, char *topic);
 
 /**
+ * @brief dbtree_retain_count - Number of retained messages currently stored.
+ * @param db - retain dbtree
+ * @return count, 0 for a NULL tree. Lock-free; safe to call from any thread.
+ */
+NNG_DECL uint64_t dbtree_retain_count(dbtree *db);
+
+/**
  * @brief dbtree_find_retain - Get all retain message to this topic.
  * @param db - dbtree
  * @param topic - topic

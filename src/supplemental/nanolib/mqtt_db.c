@@ -38,8 +38,11 @@ struct dbtree_node {
 };
 
 struct dbtree {
-	dbtree_node *root;
-	nni_rwlock   rwlock;
+	dbtree_node   *root;
+	nni_rwlock     rwlock;
+	// Number of retained messages stored in this tree; only meaningful for
+	// the retain tree. Written under rwlock, read lock-free for statistics.
+	nni_atomic_u64 retain_cnt;
 };
 
 /**
@@ -469,6 +472,7 @@ dbtree_create(dbtree **db)
 	dbtree_node *node = dbtree_node_new("\0");
 	(*db)->root       = node;
 	nni_rwlock_init(&(*db)->rwlock);
+	nni_atomic_init64(&(*db)->retain_cnt);
 #ifdef RANDOM
 	srand(time(NULL));
 #endif
@@ -1099,7 +1103,20 @@ insert_dbtree_retain(dbtree_node *node, void *args)
 nng_msg *
 dbtree_insert_retain(dbtree *db, char *topic, nng_msg *ret_msg)
 {
-	return search_insert_node(db, topic, ret_msg, insert_dbtree_retain);
+	nng_msg *old =
+	    search_insert_node(db, topic, ret_msg, insert_dbtree_retain);
+	// insert_dbtree_retain returns the message it replaced: NULL means this
+	// topic had no retained message before, i.e. the count grows by one.
+	if (db != NULL && topic != NULL && ret_msg != NULL && old == NULL) {
+		nni_atomic_inc64(&db->retain_cnt);
+	}
+	return old;
+}
+
+uint64_t
+dbtree_retain_count(dbtree *db)
+{
+	return db == NULL ? 0 : nni_atomic_get64(&db->retain_cnt);
 }
 
 nng_msg **
@@ -1342,6 +1359,9 @@ dbtree_delete_retain(dbtree *db, char *topic)
 
 	if (node->child) {
 		ret = delete_dbtree_retain(node->child[index]);
+		if (ret != NULL) {
+			nni_atomic_sub64(&db->retain_cnt, 1);
+		}
 		// print_client(node->child[index]->clients);
 		delete_dbtree_node(node, index);
 		// print_client(node->child[index]->clients);
