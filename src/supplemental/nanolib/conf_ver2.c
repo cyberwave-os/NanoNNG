@@ -275,6 +275,16 @@ hocon_get_obj(char *key, cJSON *jso)
 }
 
 static void
+conf_sys_topic_parse_ver2(conf_sys_topic *sys_topic, cJSON *json)
+{
+	cJSON *jso_sys = cJSON_GetObjectItem(json, "sys_topic");
+	if (jso_sys) {
+		hocon_read_bool_base(sys_topic, enable, "enable", jso_sys);
+		hocon_read_num_base(sys_topic, interval, "interval", jso_sys);
+	}
+}
+
+static void
 conf_http_server_parse_ver2(conf_http_server *http_server, cJSON *json)
 {
 	// http server
@@ -414,6 +424,7 @@ conf_basic_parse_ver2(conf *config, cJSON *jso)
 	}
 
 	conf_http_server_parse_ver2(&(config->http_server), jso);
+	conf_sys_topic_parse_ver2(&(config->sys_topic), jso);
 
 	return;
 }

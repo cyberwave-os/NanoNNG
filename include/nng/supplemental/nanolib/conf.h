@@ -211,6 +211,16 @@ struct conf_http_server {
 
 typedef struct conf_http_server conf_http_server;
 
+// Periodic Mosquitto-compatible $SYS/broker/... statistics. The publisher
+// injects messages through the internal HTTP-server path, so it needs
+// http_server to be enabled.
+struct conf_sys_topic {
+	bool     enable;
+	uint32_t interval; // seconds
+};
+
+typedef struct conf_sys_topic conf_sys_topic;
+
 struct conf_websocket {
 	bool  enable;
 	bool  tls_enable;
@@ -672,6 +682,7 @@ struct conf {
 	conf_sqlite          sqlite;
 	conf_tls             tls;
 	conf_http_server     http_server;
+	conf_sys_topic       sys_topic;
 	conf_websocket       websocket;
 	conf_preset_session  pre_sessions;
 	conf_bridge          bridge;		//standard MQTT

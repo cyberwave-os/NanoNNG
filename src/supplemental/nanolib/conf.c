@@ -947,6 +947,9 @@ conf_init(conf *nanomq_conf)
 
 	conf_http_server_init(&nanomq_conf->http_server, 8081);
 
+	nanomq_conf->sys_topic.enable   = false;
+	nanomq_conf->sys_topic.interval = 10;
+
 	nanomq_conf->websocket.enable     = false;
 	nanomq_conf->websocket.tls_enable = false;
 	nanomq_conf->websocket.url        = NULL;

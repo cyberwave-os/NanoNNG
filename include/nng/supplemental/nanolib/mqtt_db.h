@@ -117,6 +117,12 @@ NNG_DECL nng_msg *dbtree_delete_retain(dbtree *db, char *topic);
 NNG_DECL uint64_t dbtree_retain_count(dbtree *db);
 
 /**
+ * @brief dbtree_subscription_count - Number of (topic filter, pipe)
+ * subscriptions currently held in the subscription tree. Lock-free.
+ */
+NNG_DECL uint64_t dbtree_subscription_count(void);
+
+/**
  * @brief dbtree_find_retain - Get all retain message to this topic.
  * @param db - dbtree
  * @param topic - topic

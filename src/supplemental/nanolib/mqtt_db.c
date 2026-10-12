@@ -37,6 +37,18 @@ struct dbtree_node {
 	nni_rwlock rwlock;
 };
 
+// Number of (topic filter, pipe) subscriptions across all dbtrees. The broker
+// keeps a single subscription tree, so a process-wide counter is enough.
+// Static storage is zero-initialised; dbtree_create() re-inits it before any
+// subscription can exist.
+static nni_atomic_u64 g_sub_cnt;
+
+uint64_t
+dbtree_subscription_count(void)
+{
+	return nni_atomic_get64(&g_sub_cnt);
+}
+
 struct dbtree {
 	dbtree_node   *root;
 	nni_rwlock     rwlock;
@@ -473,6 +485,7 @@ dbtree_create(dbtree **db)
 	(*db)->root       = node;
 	nni_rwlock_init(&(*db)->rwlock);
 	nni_atomic_init64(&(*db)->retain_cnt);
+	nni_atomic_init64(&g_sub_cnt);
 #ifdef RANDOM
 	srand(time(NULL));
 #endif
@@ -520,6 +533,7 @@ insert_client_cb(dbtree_node *node, void *pipe_id)
 			cvector_insert(
 			    node->clients, index, *(uint32_t *) pipe_id);
 		}
+		nni_atomic_inc64(&g_sub_cnt);
 	}
 	nni_rwlock_unlock(&(node->rwlock));
 	return NULL;
@@ -925,6 +939,7 @@ delete_dbtree_client(dbtree_node *node, uint32_t pipe_id)
 	if (true ==
 	    binary_search_uint32(node->clients, 0, &index, pipe_id, ids_cmp)) {
 		cvector_erase(node->clients, (size_t) index);
+		nni_atomic_sub64(&g_sub_cnt, 1);
 		print_client(node->clients);
 
 		if (cvector_empty(node->clients)) {
@@ -1100,6 +1115,14 @@ insert_dbtree_retain(dbtree_node *node, void *args)
 	return ret;
 }
 
+// $SYS topics are retained broker-internal state, not user data: they stay out
+// of the retained message count.
+static bool
+is_sys_topic(const char *topic)
+{
+	return strncmp(topic, "$SYS/", 5) == 0;
+}
+
 nng_msg *
 dbtree_insert_retain(dbtree *db, char *topic, nng_msg *ret_msg)
 {
@@ -1107,7 +1130,8 @@ dbtree_insert_retain(dbtree *db, char *topic, nng_msg *ret_msg)
 	    search_insert_node(db, topic, ret_msg, insert_dbtree_retain);
 	// insert_dbtree_retain returns the message it replaced: NULL means this
 	// topic had no retained message before, i.e. the count grows by one.
-	if (db != NULL && topic != NULL && ret_msg != NULL && old == NULL) {
+	if (db != NULL && topic != NULL && ret_msg != NULL && old == NULL &&
+	    !is_sys_topic(topic)) {
 		nni_atomic_inc64(&db->retain_cnt);
 	}
 	return old;
@@ -1359,7 +1383,7 @@ dbtree_delete_retain(dbtree *db, char *topic)
 
 	if (node->child) {
 		ret = delete_dbtree_retain(node->child[index]);
-		if (ret != NULL) {
+		if (ret != NULL && !is_sys_topic(topic)) {
 			nni_atomic_sub64(&db->retain_cnt, 1);
 		}
 		// print_client(node->child[index]->clients);
