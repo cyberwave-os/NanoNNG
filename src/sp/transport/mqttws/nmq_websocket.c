@@ -70,17 +70,26 @@ ws_parse_remaining_length(const uint8_t *buf, size_t avail, uint8_t *pos,
 	return NNG_EMSGSIZE;
 }
 
+// A client that upgrades to WebSocket must send MQTT CONNECT within this time.
+#define WS_CONNECT_TIMEOUT_MS 10000
+
 struct ws_listener {
 	uint16_t             peer; // remote protocol
 	conf                *conf;
-	nni_list             aios;
+	nni_list             aios;   // accept requests from the core, waiting for a pipe
+	nni_list             ready;  // pipes that completed CONNECT, waiting for an accept request
 	nni_mtx              mtx;
-	nni_aio             *accaio;
+	nni_aio             *accaio; // accept loop on the stream listener
+	nni_aio             *tmoaio; // back-off after a failed accept
 	nng_stream_listener *listener;
 	bool                 started;
+	bool                 accepting;
+	bool                 closed;
 };
 
 struct ws_pipe {
+	nni_list_node node;     // in ws_listener.ready
+	ws_listener  *listener; // set until the core owns the pipe
 	nni_mtx     mtx;
 	uint8_t     txlen[NANO_MIN_PACKET_LEN];
 	uint8_t    *qos_buf; // msg trunk for qos & V4/V5 conversion
@@ -1560,22 +1569,32 @@ static void
 wstran_listener_accept(void *arg, nni_aio *aio)
 {
 	ws_listener *l = arg;
+	ws_pipe     *p;
 	int          rv;
 
-	// We already bound, so we just need to look for an available
-	// pipe (created by the handler), and match it.
-	// Otherwise we stick the AIO in the accept list.
+	// Streams are accepted and negotiated independently of the core's
+	// accept requests (see wstran_accept_cb); a request is matched with the
+	// next pipe that has completed CONNECT.
 	if (nni_aio_begin(aio) != 0) {
 		return;
 	}
 	nni_mtx_lock(&l->mtx);
+	if ((p = nni_list_first(&l->ready)) != NULL) {
+		nni_list_remove(&l->ready, p);
+		p->listener = NULL;
+		nni_aio_set_output(aio, 0, p);
+		nni_aio_finish(aio, 0, 0);
+		nni_mtx_unlock(&l->mtx);
+		return;
+	}
 	if ((rv = nni_aio_schedule(aio, ws_listener_cancel, l)) != 0) {
 		nni_mtx_unlock(&l->mtx);
 		nni_aio_finish_error(aio, rv);
 		return;
 	}
 	nni_list_append(&l->aios, aio);
-	if (aio == nni_list_first(&l->aios)) {
+	if (!l->accepting && !l->closed) {
+		l->accepting = true;
 		nng_stream_listener_accept(l->listener, l->accaio);
 	}
 	nni_mtx_unlock(&l->mtx);
@@ -1679,13 +1698,24 @@ static nni_sp_pipe_ops ws_pipe_ops = {
 };
 
 static void
+wstran_pipe_discard(ws_pipe *p);
+
+static void
 wstran_listener_fini(void *arg)
 {
 	ws_listener *l = arg;
+	ws_pipe     *p;
 
 	nni_aio_stop(l->accaio);
+	nni_aio_stop(l->tmoaio);
+	// Pipes that finished CONNECT but were never handed to the core.
+	while ((p = nni_list_first(&l->ready)) != NULL) {
+		nni_list_remove(&l->ready, p);
+		wstran_pipe_discard(p);
+	}
 	nng_stream_listener_free(l->listener);
 	nni_aio_free(l->accaio);
+	nni_aio_free(l->tmoaio);
 	nni_mtx_fini(&l->mtx);
 	NNI_FREE_STRUCT(l);
 }
@@ -1695,7 +1725,11 @@ wstran_listener_close(void *arg)
 {
 	ws_listener *l = arg;
 
+	nni_mtx_lock(&l->mtx);
+	l->closed = true;
+	nni_mtx_unlock(&l->mtx);
 	nni_aio_close(l->accaio);
+	nni_aio_close(l->tmoaio);
 	nng_stream_listener_close(l->listener);
 }
 
@@ -1711,42 +1745,145 @@ ws_pipe_start(ws_pipe *pipe, nng_stream *conn, ws_listener *l)
 	nng_stream_recv(p->ws, p->rxaio);
 }
 
+// Free a pipe the core never saw: negotiation failed or the listener closed.
+static void
+wstran_pipe_discard(ws_pipe *p)
+{
+	nng_stream_close(p->ws);
+	// Wait out a receive callback that is still unwinding.
+	wstran_pipe_stop(p);
+	wstran_pipe_fini(p);
+}
+
+// Unlike the TCP transport, which negotiates each connection on its own, this
+// transport used to hand the single accept request of the core to the first
+// stream and only accept the next stream once that client had sent CONNECT.
+// One client that upgraded and stayed silent therefore stalled every other
+// WebSocket client (their CONNECT sat unread in the socket) until it sent
+// CONNECT or disconnected. Behind a load balancer that opens and holds
+// upgraded connections this made CONNECT time out about half of the time.
+// Each stream now negotiates independently with its own aio, under a deadline.
+static void
+wstran_nego_cancel(nni_aio *aio, void *arg, int rv)
+{
+	ws_pipe *p = arg;
+	NNI_ARG_UNUSED(aio);
+
+	// Deadline passed or listener closing: fail the pending receive. The
+	// receive callback then completes the negotiation aio with an error.
+	nni_aio_abort(p->rxaio, rv);
+	nng_stream_close(p->ws);
+}
+
+static void
+wstran_nego_cb(void *arg)
+{
+	ws_pipe     *p = arg;
+	ws_listener *l = p->listener;
+	nni_aio     *ep;
+	nni_aio     *uaio;
+	int          rv;
+
+	nni_mtx_lock(&p->mtx);
+	ep        = p->ep_aio;
+	p->ep_aio = NULL;
+	nni_mtx_unlock(&p->mtx);
+	rv = nni_aio_result(ep);
+	nni_aio_reap(ep);
+
+	nni_mtx_lock(&l->mtx);
+	if (rv == 0 && !l->closed) {
+		if ((uaio = nni_list_first(&l->aios)) != NULL) {
+			nni_aio_list_remove(uaio);
+			p->listener = NULL;
+			nni_aio_set_output(uaio, 0, p);
+			nni_aio_finish(uaio, 0, 0);
+		} else {
+			nni_list_append(&l->ready, p);
+		}
+		nni_mtx_unlock(&l->mtx);
+		return;
+	}
+	nni_mtx_unlock(&l->mtx);
+	if (rv != 0) {
+		log_debug("WebSocket closed before CONNECT: %s", nng_strerror(rv));
+	}
+	wstran_pipe_discard(p);
+}
+
+static void
+wstran_nego_start(ws_listener *l, nng_stream *ws)
+{
+	ws_pipe *p;
+	nni_aio *ep;
+	int      rv;
+
+	if (wstran_pipe_alloc(&p, ws) != 0) {
+		nng_stream_free(ws);
+		return;
+	}
+	p->peer     = l->peer;
+	p->listener = l;
+	if ((rv = nni_aio_alloc(&ep, wstran_nego_cb, p)) != 0) {
+		wstran_pipe_discard(p);
+		return;
+	}
+	nni_aio_set_timeout(ep, WS_CONNECT_TIMEOUT_MS);
+	p->ep_aio = ep;
+	if (nni_aio_begin(ep) != 0) {
+		p->ep_aio = NULL;
+		nni_aio_reap(ep);
+		wstran_pipe_discard(p);
+		return;
+	}
+	if ((rv = nni_aio_schedule(ep, wstran_nego_cancel, p)) != 0) {
+		// Completes ep with the error; wstran_nego_cb discards the pipe.
+		nni_aio_finish_error(ep, rv);
+		return;
+	}
+	ws_pipe_start(p, p->ws, l);
+}
+
+static void
+wstran_accept_tmo_cb(void *arg)
+{
+	ws_listener *l = arg;
+
+	if (nni_aio_result(l->tmoaio) == 0) {
+		nni_mtx_lock(&l->mtx);
+		if (!l->closed) {
+			nng_stream_listener_accept(l->listener, l->accaio);
+		}
+		nni_mtx_unlock(&l->mtx);
+	}
+}
+
 static void
 wstran_accept_cb(void *arg)
 {
-	ws_listener *l    = arg;
-	nni_aio *    aaio = l->accaio;
-	nni_aio *    uaio;
+	ws_listener *l   = arg;
+	nni_aio     *aaio = l->accaio;
 	int          rv;
 
 	nni_mtx_lock(&l->mtx);
-	uaio = nni_list_first(&l->aios);
-	if ((rv = nni_aio_result(aaio)) != 0) {
-		if (uaio != NULL) {
-			nni_aio_list_remove(uaio);
-			nni_aio_finish_error(uaio, rv);
-		}
-	} else {
-		nng_stream *ws = nni_aio_get_output(aaio, 0);
-		if (uaio != NULL) {
-			ws_pipe *p;
-			// Make a pipe
-			nni_aio_list_remove(uaio);
-			if ((rv = wstran_pipe_alloc(&p, ws)) != 0) {
-				nng_stream_free(ws);
-				nni_aio_finish_error(uaio, rv);
-			} else {
-				p->peer = l->peer;
-				p->ep_aio = uaio;
-				ws_pipe_start(p, p->ws, l);
-			}
-		} else {
-			nng_stream_free(ws);
-		}
+	if ((rv = nni_aio_result(aaio)) == 0) {
+		wstran_nego_start(l, nni_aio_get_output(aaio, 0));
 	}
-
-	if (!nni_list_empty(&l->aios)) {
-		nng_stream_listener_accept(l->listener, aaio);
+	switch (rv) {
+	case NNG_ECLOSED:
+	case NNG_ECANCELED:
+		l->accepting = false;
+		break;
+	case NNG_ENOMEM:
+	case NNG_ENOFILES:
+		// Do not spin while out of resources.
+		nng_sleep_aio(100, l->tmoaio);
+		break;
+	default:
+		if (!l->closed) {
+			nng_stream_listener_accept(l->listener, aaio);
+		}
+		break;
 	}
 	nni_mtx_unlock(&l->mtx);
 }
@@ -1767,6 +1904,7 @@ wstran_listener_init(void **lp, nng_url *url, nni_listener *listener)
 	nni_mtx_init(&l->mtx);
 
 	nni_aio_list_init(&l->aios);
+	NNI_LIST_INIT(&l->ready, ws_pipe, node);
 
 	l->peer = nni_sock_peer_id(s);
 
@@ -1774,6 +1912,7 @@ wstran_listener_init(void **lp, nng_url *url, nni_listener *listener)
 
 	if (((rv = nni_ws_listener_alloc(&l->listener, url)) != 0) ||
 	    ((rv = nni_aio_alloc(&l->accaio, wstran_accept_cb, l)) != 0) ||
+	    ((rv = nni_aio_alloc(&l->tmoaio, wstran_accept_tmo_cb, l)) != 0) ||
 	    ((rv = nng_stream_listener_set_bool(
 	          l->listener, NNI_OPT_WS_MSGMODE, true)) != 0) ||
 	    ((rv = nng_stream_listener_set_string(
