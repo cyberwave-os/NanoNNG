@@ -251,6 +251,10 @@ nano_pipe_timer_cb(void *arg)
 			nni_atomic_set(&p->reason_code, NMQ_KEEP_ALIVE_TIMEOUT);
 			nni_mtx_unlock(&p->lk);
 			nni_pipe_close(p->pipe);
+			// A kept session caches the pipe, and only this timer
+			// frees it later: on session expiry or after a resume.
+			if (nni_atomic_get_bool(&npipe->cache))
+				nni_sleep_aio(qos_duration * 1000, &p->aio_timer);
 			return;
 		}
 	}
